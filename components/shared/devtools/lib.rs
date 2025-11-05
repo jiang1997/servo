@@ -24,6 +24,7 @@ use embedder_traits::Theme;
 use http::{HeaderMap, Method};
 use ipc_channel::ipc::IpcSender;
 use malloc_size_of_derive::MallocSizeOf;
+use net_traits::TlsSecurityInfo;
 use net_traits::http_status::HttpStatus;
 use net_traits::request::Destination;
 use serde::{Deserialize, Serialize};
@@ -466,6 +467,7 @@ pub struct HttpResponse {
     pub body: Option<Vec<u8>>,
     pub pipeline_id: PipelineId,
     pub browsing_context_id: BrowsingContextId,
+    pub security_info: Option<TlsSecurityInfo>,
 }
 
 #[derive(Debug)]

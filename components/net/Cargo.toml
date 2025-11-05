@@ -76,6 +76,7 @@ url = { workspace = true }
 uuid = { workspace = true }
 webpki-roots = { workspace = true }
 webrender_api = { workspace = true }
+x509-parser = "0.15"
 
 [dev-dependencies]
 embedder_traits = { workspace = true, features = ["baked-default-resources"] }

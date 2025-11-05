@@ -14,11 +14,16 @@ use devtools_traits::{HttpRequest as DevtoolsHttpRequest, HttpResponse as Devtoo
 use headers::{ContentLength, ContentType, Cookie, HeaderMapExt};
 use http::{HeaderMap, Method};
 use net::cookie::ServoCookie;
-use net_traits::CookieSource;
 use net_traits::request::Destination as RequestDestination;
+use net_traits::{CookieSource, TlsSecurityInfo};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use servo_url::ServoUrl;
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
+use x509_parser::objects::{oid2description, oid2sn, oid_registry};
+use x509_parser::oid_registry::Oid;
+use x509_parser::prelude::*;
 
 use crate::StreamId;
 use crate::actor::{Actor, ActorError, ActorRegistry};
@@ -47,6 +52,7 @@ pub struct NetworkEventActor {
     pub response_headers: Option<ResponseHeadersMsg>,
     pub total_time: Duration,
     pub security_state: String,
+    pub security_info: Option<TlsSecurityInfo>,
     pub event_timing: Option<Timings>,
     pub watcher_name: String,
 }
@@ -224,8 +230,260 @@ struct GetEventTimingsReply {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CertificateIdentity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    common_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organizational_unit: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CertificateValidity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    start: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    end: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lifetime: Option<String>,
+    expired: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CertificateFingerprint {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sha1: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SecurityCertificate {
+    subject: CertificateIdentity,
+    issuer: CertificateIdentity,
+    validity: CertificateValidity,
+    fingerprint: CertificateFingerprint,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    serial_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    is_built_in_root: Option<bool>,
+}
+
+impl SecurityCertificate {
+    fn from_chain(chain: &[Vec<u8>]) -> (Self, Option<String>) {
+        if let Some(leaf) = chain.first() {
+            if let Ok((_, parsed)) = X509Certificate::from_der(leaf) {
+                let subject = identity_from_name(parsed.subject());
+                let issuer = identity_from_name(parsed.issuer());
+                let validity = certificate_validity(parsed.validity());
+                let fingerprint = certificate_fingerprint(leaf);
+                let serial_number = Some(format_serial(parsed.raw_serial()));
+                let signature_scheme = Some(describe_signature_oid(
+                    &parsed.signature_algorithm.algorithm,
+                ));
+                let certificate = SecurityCertificate {
+                    subject,
+                    issuer,
+                    validity,
+                    fingerprint,
+                    serial_number,
+                    is_built_in_root: None,
+                };
+                return (certificate, signature_scheme);
+            }
+
+            let mut certificate = SecurityCertificate::placeholder();
+            certificate.fingerprint = certificate_fingerprint(leaf);
+            return (certificate, None);
+        }
+
+        (SecurityCertificate::placeholder(), None)
+    }
+
+    fn placeholder() -> Self {
+        SecurityCertificate {
+            subject: CertificateIdentity {
+                name: None,
+                common_name: None,
+                organization: None,
+                organizational_unit: None,
+            },
+            issuer: CertificateIdentity {
+                name: None,
+                common_name: None,
+                organization: None,
+                organizational_unit: None,
+            },
+            validity: CertificateValidity {
+                start: None,
+                end: None,
+                lifetime: None,
+                expired: false,
+            },
+            fingerprint: CertificateFingerprint {
+                sha256: None,
+                sha1: None,
+            },
+            serial_number: None,
+            is_built_in_root: None,
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct SecurityInfo {
     state: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    weakness_reasons: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cipher_suite: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kea_group_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    signature_scheme_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alpn_protocol: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certificate_transparency: Option<String>,
+    hsts: bool,
+    hpkp: bool,
+    used_ech: bool,
+    used_delegated_credentials: bool,
+    used_ocsp: bool,
+    used_private_dns: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    certificate_chain: Vec<String>,
+    cert: SecurityCertificate,
+}
+
+fn format_fingerprint(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{:02X}", byte))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn identity_from_name(name: &X509Name<'_>) -> CertificateIdentity {
+    CertificateIdentity {
+        name: Some(name.to_string()).filter(|s| !s.is_empty()),
+        common_name: first_attr_string(name.iter_common_name()),
+        organization: first_attr_string(name.iter_organization()),
+        organizational_unit: first_attr_string(name.iter_organizational_unit()),
+    }
+}
+
+fn certificate_validity(validity: &Validity) -> CertificateValidity {
+    let start = validity.not_before.to_string();
+    let end = validity.not_after.to_string();
+    let expired = validity.not_after.timestamp() < ASN1Time::now().timestamp();
+
+    CertificateValidity {
+        start: Some(start),
+        end: Some(end),
+        lifetime: None,
+        expired,
+    }
+}
+
+fn certificate_fingerprint(der: &[u8]) -> CertificateFingerprint {
+    let sha256 = Sha256::digest(der);
+    let sha1 = Sha1::digest(der);
+    CertificateFingerprint {
+        sha256: Some(format_fingerprint(sha256.as_slice())),
+        sha1: Some(format_fingerprint(sha1.as_slice())),
+    }
+}
+
+fn format_serial(serial: &[u8]) -> String {
+    serial
+        .iter()
+        .map(|byte| format!("{:02X}", byte))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+fn describe_signature_oid(oid: &Oid<'_>) -> String {
+    let registry = oid_registry();
+    oid2sn(oid, registry)
+        .or_else(|_| oid2description(oid, registry))
+        .map(|name| name.to_string())
+        .unwrap_or_else(|_| oid.to_id_string())
+}
+
+fn first_attr_string<'a, I>(mut iter: I) -> Option<String>
+where
+    I: Iterator<Item = &'a AttributeTypeAndValue<'a>>,
+{
+    iter.next()
+        .and_then(|attr| attr.as_str().ok())
+        .map(|s| s.to_owned())
+}
+
+impl SecurityInfo {
+    fn from_tls(info: &TlsSecurityInfo) -> Self {
+        let certificate_chain: Vec<String> = info
+            .certificate_chain_der
+            .iter()
+            .map(|cert| STANDARD.encode(cert))
+            .collect();
+        let (certificate, _) = SecurityCertificate::from_chain(&info.certificate_chain_der);
+        let signature_scheme = info.signature_scheme_name.clone();
+        let certificate_transparency = info
+            .certificate_transparency
+            .clone()
+            .or_else(|| Some("unknown".to_string()));
+
+        Self {
+            state: info.state.to_string(),
+            weakness_reasons: info.weakness_reasons.clone(),
+            protocol_version: info.protocol_version.clone(),
+            cipher_suite: info.cipher_suite.clone(),
+            kea_group_name: info.kea_group_name.clone(),
+            signature_scheme_name: signature_scheme,
+            alpn_protocol: info.alpn_protocol.clone(),
+            certificate_transparency,
+            hsts: info.hsts,
+            hpkp: info.hpkp,
+            used_ech: info.used_ech,
+            used_delegated_credentials: info.used_delegated_credentials,
+            used_ocsp: info.used_ocsp,
+            used_private_dns: info.used_private_dns,
+            certificate_chain,
+            cert: certificate,
+        }
+    }
+
+    fn placeholder(state: String) -> Self {
+        Self {
+            state,
+            weakness_reasons: Vec::new(),
+            protocol_version: None,
+            cipher_suite: None,
+            kea_group_name: None,
+            signature_scheme_name: None,
+            alpn_protocol: None,
+            certificate_transparency: Some("unknown".to_string()),
+            hsts: false,
+            hpkp: false,
+            used_ech: false,
+            used_delegated_credentials: false,
+            used_ocsp: false,
+            used_private_dns: false,
+            certificate_chain: Vec::new(),
+            cert: SecurityCertificate::placeholder(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -408,12 +666,13 @@ impl Actor for NetworkEventActor {
                 request.reply_final(&msg)?
             },
             "getSecurityInfo" => {
-                // TODO: Send the correct values for securityInfo.
                 let msg = GetSecurityInfoReply {
                     from: self.name(),
-                    security_info: SecurityInfo {
-                        state: "insecure".to_owned(),
-                    },
+                    security_info: self
+                        .security_info
+                        .as_ref()
+                        .map(SecurityInfo::from_tls)
+                        .unwrap_or_else(|| SecurityInfo::placeholder(self.security_state.clone())),
                 };
                 request.reply_final(&msg)?
             },
@@ -449,6 +708,7 @@ impl NetworkEventActor {
             response_headers: None,
             total_time: Duration::ZERO,
             security_state: "insecure".to_owned(),
+            security_info: None,
             event_timing: None,
             watcher_name,
         }
@@ -480,6 +740,10 @@ impl NetworkEventActor {
             self.response_content = Some(response_content);
         }
         self.response_headers_raw = response.headers.clone();
+        if let Some(security_info) = response.security_info {
+            self.security_state = security_info.state.to_string();
+            self.security_info = Some(security_info);
+        }
     }
 
     pub fn event_actor(&self) -> EventActor {
@@ -700,6 +964,15 @@ impl NetworkEventActor {
             Value::String(self.security_state.clone()),
         );
         resource_updates.insert(
+            "securityInfoAvailable".to_string(),
+            Value::Bool(self.security_info.is_some()),
+        );
+        if let Some(info) = self.security_info.as_ref() {
+            if let Ok(serialized) = serde_json::to_value(SecurityInfo::from_tls(info)) {
+                resource_updates.insert("securityInfo".to_string(), serialized);
+            }
+        }
+        resource_updates.insert(
             "eventTimingsAvailable".to_owned(),
             Value::Bool(self.event_timing.is_some()),
         );
@@ -719,5 +992,137 @@ impl NetworkEventActor {
             browsing_context_id: 0,
             inner_window_id: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod security_info_tests {
+    use super::{SecurityCertificate, SecurityInfo};
+    use base64::engine::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use net_traits::{TlsSecurityInfo, TlsSecurityState};
+
+    #[test]
+    fn from_tls_copies_fields_and_encodes_der() {
+        let tls_info = TlsSecurityInfo {
+            state: TlsSecurityState::Secure,
+            weakness_reasons: vec!["protocolVersion".to_string()],
+            protocol_version: Some("TLS 1.2".to_string()),
+            cipher_suite: Some("TLS_AES_128_GCM_SHA256".to_string()),
+            kea_group_name: Some("X25519".to_string()),
+            signature_scheme_name: Some("ECDSA_P256_SHA256".to_string()),
+            alpn_protocol: Some("h2".to_string()),
+            certificate_chain_der: vec![vec![0xDE, 0xAD, 0xBE, 0xEF]],
+            certificate_transparency: Some("policy-compliant".to_string()),
+            hsts: true,
+            hpkp: false,
+            used_ech: false,
+            used_delegated_credentials: false,
+            used_ocsp: true,
+            used_private_dns: false,
+        };
+
+        let security_info = SecurityInfo::from_tls(&tls_info);
+
+        assert_eq!(security_info.state, tls_info.state.to_string());
+        assert_eq!(security_info.weakness_reasons, tls_info.weakness_reasons);
+        assert_eq!(security_info.protocol_version, tls_info.protocol_version);
+        assert_eq!(security_info.cipher_suite, tls_info.cipher_suite);
+        assert_eq!(security_info.kea_group_name, tls_info.kea_group_name);
+        assert_eq!(
+            security_info.signature_scheme_name,
+            tls_info.signature_scheme_name
+        );
+        assert_eq!(security_info.alpn_protocol, tls_info.alpn_protocol);
+        assert_eq!(
+            security_info.certificate_transparency,
+            tls_info.certificate_transparency
+        );
+        assert!(security_info.hsts);
+        assert!(security_info.used_ocsp);
+        assert_eq!(
+            security_info.certificate_chain,
+            vec!["3q2+7w==".to_string()]
+        );
+        assert_eq!(
+            security_info.cert.fingerprint.sha256,
+            Some(
+                "5F:78:C3:32:74:E4:3F:A9:DE:56:59:26:5C:1D:91:7E:25:C0:37:22:DC:B0:B8:D2:7D:B8:D5:FE:AA:81:39:53"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            security_info.cert.fingerprint.sha1,
+            Some("D7:8F:8B:B9:92:A5:6A:59:7F:6C:7A:1F:B9:18:BB:78:27:13:67:EB".to_string())
+        );
+    }
+
+    #[test]
+    fn placeholder_uses_defaults() {
+        let security_info = SecurityInfo::placeholder("insecure".to_string());
+        assert_eq!(security_info.state, "insecure");
+        assert!(security_info.weakness_reasons.is_empty());
+        assert!(security_info.protocol_version.is_none());
+        assert!(!security_info.hsts);
+        assert!(security_info.certificate_chain.is_empty());
+        assert!(security_info.cert.fingerprint.sha256.is_none());
+        assert_eq!(
+            security_info.certificate_transparency,
+            Some("unknown".to_string())
+        );
+        assert!(security_info.cert.subject.organizational_unit.is_none());
+    }
+
+    #[test]
+    fn signature_scheme_remains_none_when_missing() {
+        const CERT_PEM: &str =
+            include_str!("../../../tests/wpt/tests/tools/certs/web-platform.test.pem");
+        let der = decode_first_certificate(CERT_PEM);
+
+        let tls_info = TlsSecurityInfo {
+            state: TlsSecurityState::Secure,
+            weakness_reasons: Vec::new(),
+            protocol_version: Some("TLS 1.2".to_string()),
+            cipher_suite: Some("TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256".to_string()),
+            kea_group_name: None,
+            signature_scheme_name: None,
+            alpn_protocol: None,
+            certificate_chain_der: vec![der],
+            certificate_transparency: None,
+            hsts: false,
+            hpkp: false,
+            used_ech: false,
+            used_delegated_credentials: false,
+            used_ocsp: false,
+            used_private_dns: false,
+        };
+
+        let security_info = SecurityInfo::from_tls(&tls_info);
+        assert!(security_info.signature_scheme_name.is_none());
+        let subject = security_info
+            .cert
+            .subject
+            .name
+            .expect("subject name present");
+        assert!(subject.contains("web-platform.test"));
+    }
+
+    fn decode_first_certificate(pem: &str) -> Vec<u8> {
+        let mut collecting = false;
+        let mut buffer = String::new();
+        for line in pem.lines() {
+            if line == "-----BEGIN CERTIFICATE-----" {
+                collecting = true;
+                continue;
+            }
+            if line == "-----END CERTIFICATE-----" {
+                break;
+            }
+            if collecting {
+                buffer.push_str(line);
+            }
+        }
+
+        STANDARD.decode(buffer).expect("decode certificate")
     }
 }

@@ -1489,6 +1489,7 @@ fn test_fetch_with_devtools() {
         body: Some(content.as_bytes().to_vec()),
         pipeline_id: TEST_PIPELINE_ID,
         browsing_context_id: TEST_WEBVIEW_ID.into(),
+        security_info: None,
     };
 
     assert_eq!(devhttprequests.1, httprequest);
